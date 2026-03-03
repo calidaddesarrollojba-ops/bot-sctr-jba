@@ -1,0 +1,1 @@
+worker: python -m bot_sctr.bot_sctr
