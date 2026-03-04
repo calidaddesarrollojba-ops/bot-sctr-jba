@@ -1,10 +1,4 @@
 # bot_sctr/bot_sctr.py
-# Requisitos:
-#   python-telegram-bot==21.6
-#   gspread
-#   google-auth
-#   google-api-python-client
-#
 # Ejecuta como módulo (Railway Procfile):
 #   worker: python -m bot_sctr.bot_sctr
 
@@ -285,7 +279,7 @@ async def deliver_record(
     nombre = str(r.get("apellidos_y_nombres", "")).strip()
 
     # 1) Ficha
-    await update.effective_message.reply_text(ficha)
+    await update.effective_message.reply_text(ficha, parse_mode="Markdown")
     logger.log(
         chat_id=chat.id,
         user_id=u.id,
@@ -539,7 +533,7 @@ async def on_text(
 
     if s.state == "WAIT_DOC":
         digits = clean_digits(text)
-        if len(digits) not in (8, 9):
+        if len(digits) not in (8, 9, 7):
             await update.message.reply_text(
                 "⚠️ Documento inválido. Ingresa DNI (8) o CE (9).",
                 reply_markup=kb_back_cancel(),
@@ -680,7 +674,6 @@ async def on_text(
         await show_pick_list(update, found, logger, authz, sessions)
         return
 
-    # No está en flujo
     await update.message.reply_text("Usa /busqueda para iniciar.", reply_markup=kb_main())
 
 
@@ -688,15 +681,14 @@ async def on_text(
 
 
 def main() -> None:
-    # Repos
     sheets = SheetsRepo(config.GOOGLE_CREDS_JSON_TEXT, config.SHEET_ID)
     drive = DriveRepo(config.GOOGLE_CREDS_JSON_TEXT)
     authz = Authz()
     sessions = SessionManager(config.SESSION_TTL_MIN)
     logger = LoggingRepo(sheets, config.TAB_LOG, config.TZ_NAME)
 
-    # Cache inicial
-    asegurados_cache = load_caches(sheets, authz)
+    # Cache mutable (para /reload_sheet)
+    cache: Dict[str, List[Dict]] = {"asegurados": load_caches(sheets, authz)}
 
     app = Application.builder().token(config.BOT_TOKEN).build()
 
@@ -704,7 +696,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
 
-    # /id (bloqueo grupos dentro)
+    # /id
     async def _id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not await only_private_guard(update, logger, authz):
             return
@@ -724,15 +716,54 @@ def main() -> None:
 
     app.add_handler(CommandHandler("cancelar", _cancelar))
 
+    # ✅ /reload_sheet (solo admin/superadmin)
+    async def _reload_sheet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not await only_private_guard(update, logger, authz):
+            return
+
+        u = update.effective_user
+        chat = update.effective_chat
+
+        if not authz.is_allowed(u.id):
+            await update.effective_message.reply_text(msg.NOT_AUTH_MSG)
+            logger.log(chat.id, u.id, u.username or "", authz.role(u.id),
+                       "reload_sheet", "DENEGADO: no_autorizado", "denegado")
+            return
+
+        role = authz.role(u.id)
+        if role not in ("admin", "superadmin"):
+            await update.effective_message.reply_text("❌ Solo administradores pueden recargar datos.")
+            logger.log(chat.id, u.id, u.username or "", role,
+                       "reload_sheet", "DENEGADO: rol_sin_permiso", "denegado")
+            return
+
+        try:
+            usuarios = sheets.get_all_records(config.TAB_USUARIOS)
+            authz.load(usuarios)
+            asegurados = sheets.get_all_records(config.TAB_ASEGURADOS)
+            cache["asegurados"] = asegurados
+
+            await update.effective_message.reply_text(
+                f"✅ Recargado.\nAsegurados: {len(asegurados)}\nUsuarios: {len(usuarios)}"
+            )
+            logger.log(chat.id, u.id, u.username or "", authz.role(u.id),
+                       "reload_sheet", f"OK asegurados={len(asegurados)} usuarios={len(usuarios)}", "ok")
+        except Exception as e:
+            await update.effective_message.reply_text("⚠️ Error recargando datos (revisar permisos/Sheet).")
+            logger.log(chat.id, u.id, u.username or "", role,
+                       "reload_sheet", f"ERROR:{type(e).__name__}", "error")
+
+    app.add_handler(CommandHandler("reload_sheet", _reload_sheet))
+
     # callbacks
     async def _cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        await on_callback(update, ctx, asegurados_cache, drive, authz, sessions, logger)
+        await on_callback(update, ctx, cache["asegurados"], drive, authz, sessions, logger)
 
     app.add_handler(CallbackQueryHandler(_cb))
 
     # texto (no comandos)
     async def _text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        await on_text(update, ctx, asegurados_cache, drive, authz, sessions, logger)
+        await on_text(update, ctx, cache["asegurados"], drive, authz, sessions, logger)
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _text))
 
@@ -742,4 +773,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
