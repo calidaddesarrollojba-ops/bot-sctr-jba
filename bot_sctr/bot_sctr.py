@@ -1,12 +1,14 @@
 # bot_sctr/bot_sctr.py
-# Ejecuta como módulo (Railway Procfile):
+# Procfile:
 #   worker: python -m bot_sctr.bot_sctr
 
 from __future__ import annotations
 
-from typing import List, Dict
+from typing import List, Dict, Optional, Tuple
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.constants import ChatType
 from telegram.ext import (
     Application,
@@ -38,6 +40,13 @@ CB_AP = "M_AP"
 CB_MENU = "M_MENU"
 CB_CANCEL = "M_CANCEL"
 CB_PICK_PREFIX = "PICK_"  # PICK_0, PICK_1...
+
+# Estados admin (asistente)
+ADMIN_NEWUSER_WAIT = "ADMIN_NEWUSER_WAIT"
+
+
+def now_str(tz_name: str) -> str:
+    return datetime.now(ZoneInfo(tz_name)).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def is_private(update: Update) -> bool:
@@ -78,13 +87,9 @@ def kb_pick(n: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-async def only_private_guard(
-    update: Update,
-    logger: LoggingRepo,
-    authz: Authz,
-) -> bool:
+async def only_private_guard(update: Update, logger: LoggingRepo, authz: Authz) -> bool:
     """
-    Bloquea cualquier uso en grupos/canales. En grupo responde el mensaje de seguridad y loggea.
+    Bloquea uso en grupos/canales. En grupo responde el mensaje de seguridad y loggea.
     """
     if is_private(update):
         return True
@@ -94,7 +99,6 @@ async def only_private_guard(
     uid = user.id if user else 0
     role = authz.role(uid)
 
-    # Responde en el grupo con mensaje estándar
     if update.callback_query:
         await update.callback_query.answer()
         try:
@@ -107,7 +111,6 @@ async def only_private_guard(
         except Exception:
             pass
 
-    # Log
     text = ""
     try:
         text = (update.effective_message.text or "").strip()
@@ -127,17 +130,78 @@ async def only_private_guard(
 
 
 def load_caches(sheets: SheetsRepo, authz: Authz) -> List[Dict]:
-    """
-    Carga Asegurados y Usuarios en memoria al arranque.
-    """
     usuarios = sheets.get_all_records(config.TAB_USUARIOS)
     authz.load(usuarios)
     asegurados = sheets.get_all_records(config.TAB_ASEGURADOS)
     return asegurados
 
 
-# -------------------- Handlers --------------------
+def parse_args(text: str) -> List[str]:
+    parts = (text or "").strip().split()
+    return parts[1:]
 
+
+def get_forwarded_user_id(m: Message) -> Optional[int]:
+    """
+    Telegram a veces no expone forward_from por privacidad.
+    Si está disponible, lo usamos. Si no, retorna None.
+    """
+    try:
+        if m.forward_from:
+            return m.forward_from.id
+    except Exception:
+        pass
+    return None
+
+
+def normalize_role(role: str) -> Optional[str]:
+    r = (role or "").strip().lower()
+    if r in ("superadmin", "admin", "user"):
+        return r
+    return None
+
+
+async def require_admin(update: Update, logger: LoggingRepo, authz: Authz) -> Tuple[bool, str]:
+    """
+    Retorna (ok, role). Requiere que sea privado, autorizado y rol admin/superadmin.
+    """
+    if not await only_private_guard(update, logger, authz):
+        return (False, "")
+
+    u = update.effective_user
+    chat = update.effective_chat
+
+    if not authz.is_allowed(u.id):
+        await update.effective_message.reply_text(msg.NOT_AUTH_MSG)
+        logger.log(
+            chat_id=chat.id,
+            user_id=u.id,
+            username=u.username or "",
+            rol_detectado=authz.role(u.id),
+            accion="admin_check",
+            detalle="DENEGADO:no_autorizado",
+            resultado="denegado",
+        )
+        return (False, "")
+
+    role = authz.role(u.id)
+    if role not in ("admin", "superadmin"):
+        await update.effective_message.reply_text("❌ Solo administradores pueden usar este comando.")
+        logger.log(
+            chat_id=chat.id,
+            user_id=u.id,
+            username=u.username or "",
+            rol_detectado=role,
+            accion="admin_check",
+            detalle="DENEGADO:rol",
+            resultado="denegado",
+        )
+        return (False, role)
+
+    return (True, role)
+
+
+# -------------------- Core user handlers --------------------
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(msg.START_MSG)
@@ -163,13 +227,28 @@ async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE, logger: Logging
     )
 
 
-async def cmd_busqueda(
-    update: Update,
-    ctx: ContextTypes.DEFAULT_TYPE,
-    authz: Authz,
-    sessions: SessionManager,
-    logger: LoggingRepo,
-) -> None:
+async def cmd_mi_rol(update: Update, ctx: ContextTypes.DEFAULT_TYPE, authz: Authz, logger: LoggingRepo) -> None:
+    if not await only_private_guard(update, logger, authz):
+        return
+    u = update.effective_user
+    chat = update.effective_chat
+    role = authz.role(u.id)
+    allowed = authz.is_allowed(u.id)
+    await update.effective_message.reply_text(
+        f"👤 ID: {u.id}\n🔐 Autorizado: {'SI' if allowed else 'NO'}\n🧩 Rol: {role or '—'}"
+    )
+    logger.log(
+        chat_id=chat.id,
+        user_id=u.id,
+        username=u.username or "",
+        rol_detectado=role,
+        accion="mi_rol",
+        detalle=f"allowed={allowed}",
+        resultado="ok",
+    )
+
+
+async def cmd_busqueda(update: Update, ctx: ContextTypes.DEFAULT_TYPE, authz: Authz, sessions: SessionManager, logger: LoggingRepo) -> None:
     if not await only_private_guard(update, logger, authz):
         return
 
@@ -206,13 +285,7 @@ async def cmd_busqueda(
     )
 
 
-async def cmd_cancelar(
-    update: Update,
-    ctx: ContextTypes.DEFAULT_TYPE,
-    sessions: SessionManager,
-    logger: LoggingRepo,
-    authz: Authz,
-) -> None:
+async def cmd_cancelar(update: Update, ctx: ContextTypes.DEFAULT_TYPE, sessions: SessionManager, logger: LoggingRepo, authz: Authz) -> None:
     if not is_private(update):
         return
     u = update.effective_user
@@ -231,13 +304,7 @@ async def cmd_cancelar(
     )
 
 
-async def show_pick_list(
-    update: Update,
-    results: List[Dict],
-    logger: LoggingRepo,
-    authz: Authz,
-    sessions: SessionManager,
-) -> None:
+async def show_pick_list(update: Update, results: List[Dict], logger: LoggingRepo, authz: Authz, sessions: SessionManager) -> None:
     u = update.effective_user
     chat = update.effective_chat
 
@@ -263,14 +330,7 @@ async def show_pick_list(
     )
 
 
-async def deliver_record(
-    update: Update,
-    ctx: ContextTypes.DEFAULT_TYPE,
-    r: Dict,
-    drive: DriveRepo,
-    logger: LoggingRepo,
-    authz: Authz,
-) -> None:
+async def deliver_record(update: Update, ctx: ContextTypes.DEFAULT_TYPE, r: Dict, drive: DriveRepo, logger: LoggingRepo, authz: Authz) -> None:
     u = update.effective_user
     chat = update.effective_chat
 
@@ -278,7 +338,6 @@ async def deliver_record(
     docm = mask_doc(str(r.get("doc_norm", r.get("nro_doc", ""))))
     nombre = str(r.get("apellidos_y_nombres", "")).strip()
 
-    # 1) Ficha
     await update.effective_message.reply_text(ficha, parse_mode="Markdown")
     logger.log(
         chat_id=chat.id,
@@ -290,7 +349,6 @@ async def deliver_record(
         resultado="ok",
     )
 
-    # 2) PDF
     archivo_origen = str(r.get("archivo_origen", "")).strip()
     file_id = str(r.get("file_id_drive", "")).strip()
 
@@ -325,7 +383,7 @@ async def deliver_record(
             detalle=f"PDF_OK | ARCHIVO:{archivo_origen or name}",
             resultado="ok",
             archivo_origen=archivo_origen or name,
-            file_id_drive=file_id[:8],  # opcional: solo primeros 8
+            file_id_drive=file_id[:10],
         )
     except Exception as e:
         await update.effective_message.reply_text("📎 No pude adjuntar el PDF (revisar permisos/archivo).")
@@ -338,19 +396,11 @@ async def deliver_record(
             detalle=f"PDF_FAIL | motivo:{type(e).__name__} | ARCHIVO:{archivo_origen}",
             resultado="fallo_pdf",
             archivo_origen=archivo_origen,
-            file_id_drive=file_id[:8],
+            file_id_drive=file_id[:10],
         )
 
 
-async def on_callback(
-    update: Update,
-    ctx: ContextTypes.DEFAULT_TYPE,
-    asegurados_cache: List[Dict],
-    drive: DriveRepo,
-    authz: Authz,
-    sessions: SessionManager,
-    logger: LoggingRepo,
-) -> None:
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, asegurados_cache: List[Dict], drive: DriveRepo, authz: Authz, sessions: SessionManager, logger: LoggingRepo) -> None:
     q = update.callback_query
     await q.answer()
 
@@ -395,60 +445,23 @@ async def on_callback(
         s.state = "CHOOSE_METHOD"
         s.ctx.clear()
         await q.edit_message_text(msg.ASK_METHOD_MSG, reply_markup=kb_main())
-        logger.log(
-            chat_id=chat.id,
-            user_id=u.id,
-            username=u.username or "",
-            rol_detectado=authz.role(u.id),
-            accion="menu_busqueda",
-            detalle="MOSTRADO",
-            resultado="ok",
-        )
         return
 
     if data == CB_CANCEL:
-        st = s.state
         sessions.reset(u.id)
         await q.edit_message_text(msg.CANCELLED_MSG)
-        logger.log(
-            chat_id=chat.id,
-            user_id=u.id,
-            username=u.username or "",
-            rol_detectado=authz.role(u.id),
-            accion="cancelar",
-            detalle=f"CANCELADO_EN:{st}",
-            resultado="ok",
-        )
         return
 
     if data == CB_DOC:
         s.state = "WAIT_DOC"
         s.ctx.clear()
         await q.edit_message_text(msg.ASK_DOC_MSG, reply_markup=kb_back_cancel())
-        logger.log(
-            chat_id=chat.id,
-            user_id=u.id,
-            username=u.username or "",
-            rol_detectado=authz.role(u.id),
-            accion="metodo_seleccionado",
-            detalle="METODO:DOCUMENTO",
-            resultado="ok",
-        )
         return
 
     if data == CB_AP:
         s.state = "WAIT_AP_PATERNO"
         s.ctx.clear()
         await q.edit_message_text(msg.ASK_PAT_MSG, reply_markup=kb_back_cancel())
-        logger.log(
-            chat_id=chat.id,
-            user_id=u.id,
-            username=u.username or "",
-            rol_detectado=authz.role(u.id),
-            accion="metodo_seleccionado",
-            detalle="METODO:APELLIDOS",
-            resultado="ok",
-        )
         return
 
     if data.startswith(CB_PICK_PREFIX):
@@ -463,37 +476,16 @@ async def on_callback(
 
         results: List[Dict] = s.ctx.get("pick_results", [])
         if idx < 0 or idx >= len(results):
-            await q.edit_message_text("⚠️ Opción inválida. Vuelve a intentar.", reply_markup=kb_main())
+            await q.edit_message_text("⚠️ Opción inválida. Vuelve al menú.", reply_markup=kb_main())
             return
 
         r = results[idx]
-        docm = mask_doc(str(r.get("doc_norm", r.get("nro_doc", ""))))
-        nombre = str(r.get("apellidos_y_nombres", "")).strip()
-
-        logger.log(
-            chat_id=chat.id,
-            user_id=u.id,
-            username=u.username or "",
-            rol_detectado=authz.role(u.id),
-            accion="seleccion_opcion",
-            detalle=f"SEL:{idx+1} | NOMBRE:{nombre} | DOC:{docm}",
-            resultado="ok",
-        )
-
         await deliver_record(update, ctx, r, drive, logger, authz)
         sessions.reset(u.id)
         return
 
 
-async def on_text(
-    update: Update,
-    ctx: ContextTypes.DEFAULT_TYPE,
-    asegurados_cache: List[Dict],
-    drive: DriveRepo,
-    authz: Authz,
-    sessions: SessionManager,
-    logger: LoggingRepo,
-) -> None:
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE, asegurados_cache: List[Dict], drive: DriveRepo, authz: Authz, sessions: SessionManager, logger: LoggingRepo) -> None:
     if not await only_private_guard(update, logger, authz):
         return
 
@@ -501,31 +493,46 @@ async def on_text(
     chat = update.effective_chat
     text = (update.message.text or "").strip()
 
+    # ----- Admin assistant: /nuevo_usuario (sin args) -----
+    s_admin = sessions.get(u.id)
+    if s_admin.state == ADMIN_NEWUSER_WAIT:
+        ok, role = await require_admin(update, logger, authz)
+        if not ok:
+            sessions.reset(u.id)
+            return
+
+        # Espera: "123456789 user" o solo "123456789" (pedirá rol)
+        parts = text.split()
+        if not parts:
+            await update.effective_message.reply_text("⚠️ Envíame el user_id (y opcional rol). Ej: `123456789 user`", parse_mode="Markdown")
+            return
+
+        uid = clean_digits(parts[0])
+        if not uid:
+            await update.effective_message.reply_text("⚠️ No veo un user_id válido. Ej: `123456789 user`", parse_mode="Markdown")
+            return
+
+        rol = normalize_role(parts[1]) if len(parts) >= 2 else "user"
+        if not rol:
+            await update.effective_message.reply_text("⚠️ Rol inválido. Usa: superadmin | admin | user")
+            return
+
+        s_admin.ctx["pending_user_id"] = uid
+        s_admin.ctx["pending_role"] = rol
+        s_admin.state = ""  # salimos del asistente
+        sessions.touch(u.id)
+
+        await update.effective_message.reply_text(f"✅ Listo. Ejecuta ahora:\n`/nuevo_usuario {uid} {rol}`", parse_mode="Markdown")
+        return
+
+    # ----- Flujo normal -----
     if not authz.is_allowed(u.id):
         await update.message.reply_text(msg.NOT_AUTH_MSG)
-        logger.log(
-            chat_id=chat.id,
-            user_id=u.id,
-            username=u.username or "",
-            rol_detectado=authz.role(u.id),
-            accion="intento_no_autorizado",
-            detalle="TXT",
-            resultado="denegado",
-        )
         return
 
     if sessions.is_expired(u.id):
         sessions.reset(u.id)
         await update.message.reply_text(msg.EXPIRED_MSG)
-        logger.log(
-            chat_id=chat.id,
-            user_id=u.id,
-            username=u.username or "",
-            rol_detectado=authz.role(u.id),
-            accion="expirado",
-            detalle="EXPIRA",
-            resultado="expirado",
-        )
         return
 
     s = sessions.get(u.id)
@@ -533,75 +540,24 @@ async def on_text(
 
     if s.state == "WAIT_DOC":
         digits = clean_digits(text)
-        if len(digits) not in (8, 9, 7):
-            await update.message.reply_text(
-                "⚠️ Documento inválido. Ingresa DNI (8) o CE (9).",
-                reply_markup=kb_back_cancel(),
-            )
-            logger.log(
-                chat_id=chat.id,
-                user_id=u.id,
-                username=u.username or "",
-                rol_detectado=authz.role(u.id),
-                accion="input_documento",
-                detalle=f"DOC_INVALIDO:len={len(digits)}",
-                resultado="error_formato",
-            )
+        if len(digits) not in (7, 8, 9):
+            await update.message.reply_text("⚠️ Documento inválido. Ingresa DNI (8) o CE (9).", reply_markup=kb_back_cancel())
             return
 
-        docm = mask_doc(digits)
         found = find_by_doc(asegurados_cache, digits)
-
         if not found:
             await update.message.reply_text(msg.NO_FOUND_DOC, reply_markup=kb_main())
-            logger.log(
-                chat_id=chat.id,
-                user_id=u.id,
-                username=u.username or "",
-                rol_detectado=authz.role(u.id),
-                accion="buscar_doc",
-                detalle=f"HIT:0 DOC:{docm}",
-                resultado="no_encontrado",
-            )
             sessions.reset(u.id)
             return
 
         if len(found) > 1:
             if len(found) > config.MAX_RESULTS:
                 await update.message.reply_text(msg.TOO_MANY, reply_markup=kb_main())
-                logger.log(
-                    chat_id=chat.id,
-                    user_id=u.id,
-                    username=u.username or "",
-                    rol_detectado=authz.role(u.id),
-                    accion="buscar_doc",
-                    detalle=f"HIT:{len(found)} DOC:{docm}",
-                    resultado="demasiados",
-                )
                 sessions.reset(u.id)
                 return
-
-            logger.log(
-                chat_id=chat.id,
-                user_id=u.id,
-                username=u.username or "",
-                rol_detectado=authz.role(u.id),
-                accion="buscar_doc",
-                detalle=f"HIT:{len(found)} DOC:{docm}",
-                resultado="multiple",
-            )
             await show_pick_list(update, found, logger, authz, sessions)
             return
 
-        logger.log(
-            chat_id=chat.id,
-            user_id=u.id,
-            username=u.username or "",
-            rol_detectado=authz.role(u.id),
-            accion="buscar_doc",
-            detalle=f"HIT:1 DOC:{docm}",
-            resultado="ok",
-        )
         await deliver_record(update, ctx, found[0], drive, logger, authz)
         sessions.reset(u.id)
         return
@@ -615,70 +571,332 @@ async def on_text(
     if s.state == "WAIT_AP_MATERNO":
         paterno = s.ctx.get("paterno", "")
         materno = text
-
         found = find_by_apellidos(asegurados_cache, paterno, materno)
 
         if not found:
             await update.message.reply_text(msg.NO_FOUND_AP, reply_markup=kb_main())
-            logger.log(
-                chat_id=chat.id,
-                user_id=u.id,
-                username=u.username or "",
-                rol_detectado=authz.role(u.id),
-                accion="buscar_apellidos",
-                detalle=f"APELLIDOS:{paterno} {materno} | HIT:0",
-                resultado="no_encontrado",
-            )
             sessions.reset(u.id)
             return
 
         if len(found) == 1:
-            r = found[0]
-            docm = mask_doc(str(r.get("doc_norm", r.get("nro_doc", ""))))
-            logger.log(
-                chat_id=chat.id,
-                user_id=u.id,
-                username=u.username or "",
-                rol_detectado=authz.role(u.id),
-                accion="buscar_apellidos",
-                detalle=f"APELLIDOS:{paterno} {materno} | HIT:1 | DOC:{docm}",
-                resultado="ok",
-            )
-            await deliver_record(update, ctx, r, drive, logger, authz)
+            await deliver_record(update, ctx, found[0], drive, logger, authz)
             sessions.reset(u.id)
             return
 
         if len(found) > config.MAX_RESULTS:
             await update.message.reply_text(msg.TOO_MANY, reply_markup=kb_main())
-            logger.log(
-                chat_id=chat.id,
-                user_id=u.id,
-                username=u.username or "",
-                rol_detectado=authz.role(u.id),
-                accion="buscar_apellidos",
-                detalle=f"APELLIDOS:{paterno} {materno} | HIT:{len(found)}",
-                resultado="demasiados",
-            )
             sessions.reset(u.id)
             return
 
-        logger.log(
-            chat_id=chat.id,
-            user_id=u.id,
-            username=u.username or "",
-            rol_detectado=authz.role(u.id),
-            accion="buscar_apellidos",
-            detalle=f"APELLIDOS:{paterno} {materno} | HIT:{len(found)}",
-            resultado="multiple",
-        )
         await show_pick_list(update, found, logger, authz, sessions)
         return
 
     await update.message.reply_text("Usa /busqueda para iniciar.", reply_markup=kb_main())
 
 
-# -------------------- Bootstrap --------------------
+# -------------------- Admin commands --------------------
 
+async def cmd_reload_sheet(update: Update, ctx: ContextTypes.DEFAULT_TYPE, sheets: SheetsRepo, authz: Authz, cache: Dict[str, List[Dict]], logger: LoggingRepo) -> None:
+    ok, role = await require_admin(update, logger, authz)
+    if not ok:
+        return
+
+    u = update.effective_user
+    chat = update.effective_chat
+
+    try:
+        usuarios = sheets.get_all_records(config.TAB_USUARIOS)
+        authz.load(usuarios)
+        asegurados = sheets.get_all_records(config.TAB_ASEGURADOS)
+        cache["asegurados"] = asegurados
+
+        await update.effective_message.reply_text(
+            f"✅ Recargado.\nAsegurados: {len(asegurados)}\nUsuarios: {len(usuarios)}"
+        )
+
+        logger.log(
+            chat_id=chat.id,
+            user_id=u.id,
+            username=u.username or "",
+            rol_detectado=authz.role(u.id),
+            accion="reload_sheet",
+            detalle=f"OK asegurados={len(asegurados)} usuarios={len(usuarios)}",
+            resultado="ok",
+        )
+    except Exception as e:
+        await update.effective_message.reply_text("⚠️ Error recargando datos (revisar permisos/Sheet).")
+        logger.log(
+            chat_id=chat.id,
+            user_id=u.id,
+            username=u.username or "",
+            rol_detectado=role,
+            accion="reload_sheet",
+            detalle=f"ERROR:{type(e).__name__}",
+            resultado="error",
+        )
+
+
+async def cmd_nuevo_usuario(update: Update, ctx: ContextTypes.DEFAULT_TYPE, sheets: SheetsRepo, authz: Authz, sessions: SessionManager, logger: LoggingRepo) -> None:
+    ok, role = await require_admin(update, logger, authz)
+    if not ok:
+        return
+
+    u = update.effective_user
+    chat = update.effective_chat
+    args = parse_args(update.effective_message.text or "")
+
+    # Modo asistente (sin args)
+    if len(args) == 0:
+        s = sessions.get(u.id)
+        s.state = ADMIN_NEWUSER_WAIT
+        s.ctx.clear()
+        sessions.touch(u.id)
+        await update.effective_message.reply_text(
+            "🧩 *Nuevo usuario*\n\n"
+            "Envíame:\n"
+            "• `user_id rol` (ej: `123456789 user`)\n"
+            "o\n"
+            "• Reenvíame un mensaje del usuario (si Telegram deja ver el ID)\n\n"
+            "Roles: `superadmin | admin | user`",
+            parse_mode="Markdown",
+        )
+        logger.log(
+            chat_id=chat.id,
+            user_id=u.id,
+            username=u.username or "",
+            rol_detectado=role,
+            accion="nuevo_usuario",
+            detalle="ASISTENTE_INICIADO",
+            resultado="ok",
+        )
+        return
+
+    # Modo manual /nuevo_usuario <id> <rol?>
+    raw_id = args[0]
+    uid_target = clean_digits(raw_id)
+    if not uid_target:
+        await update.effective_message.reply_text("⚠️ Formato: `/nuevo_usuario <user_id> <rol>`", parse_mode="Markdown")
+        return
+
+    rol = normalize_role(args[1]) if len(args) >= 2 else "user"
+    if not rol:
+        await update.effective_message.reply_text("⚠️ Rol inválido. Usa: superadmin | admin | user")
+        return
+
+    # Si no eres superadmin, no puedes crear superadmin
+    if role != "superadmin" and rol == "superadmin":
+        await update.effective_message.reply_text("❌ Solo un superadmin puede asignar rol superadmin.")
+        return
+
+    # Guardar en Sheet por upsert
+    row = {
+        "user_id": str(uid_target),
+        "rol": rol,
+        "activo": 1,
+        "nombre": "",
+        "username": "",
+        "updated_at": now_str(config.TZ_NAME),
+    }
+
+    try:
+        res = sheets.upsert_by_key(config.TAB_USUARIOS, "user_id", row)
+        # refresca authz en caliente (sin /reload_sheet)
+        usuarios = sheets.get_all_records(config.TAB_USUARIOS)
+        authz.load(usuarios)
+
+        await update.effective_message.reply_text(f"✅ Usuario {res}: {uid_target} | rol={rol} | activo=1")
+        logger.log(
+            chat_id=chat.id,
+            user_id=u.id,
+            username=u.username or "",
+            rol_detectado=role,
+            accion="nuevo_usuario",
+            detalle=f"{res} user_id={uid_target} rol={rol}",
+            resultado="ok",
+        )
+    except Exception as e:
+        await update.effective_message.reply_text("⚠️ No pude guardar el usuario (revisar Sheet/headers).")
+        logger.log(
+            chat_id=chat.id,
+            user_id=u.id,
+            username=u.username or "",
+            rol_detectado=role,
+            accion="nuevo_usuario",
+            detalle=f"ERROR:{type(e).__name__}",
+            resultado="error",
+        )
+
+
+async def cmd_bloquear_usuario(update: Update, ctx: ContextTypes.DEFAULT_TYPE, sheets: SheetsRepo, authz: Authz, logger: LoggingRepo) -> None:
+    ok, role = await require_admin(update, logger, authz)
+    if not ok:
+        return
+
+    u = update.effective_user
+    chat = update.effective_chat
+    args = parse_args(update.effective_message.text or "")
+    if len(args) < 1:
+        await update.effective_message.reply_text("Formato: `/bloquear_usuario <user_id>`", parse_mode="Markdown")
+        return
+
+    uid_target = clean_digits(args[0])
+    if not uid_target:
+        await update.effective_message.reply_text("⚠️ user_id inválido.")
+        return
+
+    # Evitar que un admin bloquee a un superadmin (seguridad)
+    if role != "superadmin":
+        # recarga usuarios en memoria para verificar rol target
+        usuarios = sheets.get_all_records(config.TAB_USUARIOS)
+        for r in usuarios:
+            if str(r.get("user_id", "")).strip() == uid_target and str(r.get("rol", "")).strip().lower() == "superadmin":
+                await update.effective_message.reply_text("❌ No puedes bloquear a un superadmin.")
+                return
+
+    try:
+        row = {
+            "user_id": str(uid_target),
+            "activo": 0,
+            "updated_at": now_str(config.TZ_NAME),
+        }
+        res = sheets.upsert_by_key(config.TAB_USUARIOS, "user_id", row)
+
+        usuarios = sheets.get_all_records(config.TAB_USUARIOS)
+        authz.load(usuarios)
+
+        await update.effective_message.reply_text(f"🚫 Usuario bloqueado: {uid_target} (activo=0)")
+        logger.log(
+            chat_id=chat.id,
+            user_id=u.id,
+            username=u.username or "",
+            rol_detectado=role,
+            accion="bloquear_usuario",
+            detalle=f"{res} user_id={uid_target}",
+            resultado="ok",
+        )
+    except Exception as e:
+        await update.effective_message.reply_text("⚠️ No pude bloquear (revisar Sheet/headers).")
+        logger.log(
+            chat_id=chat.id,
+            user_id=u.id,
+            username=u.username or "",
+            rol_detectado=role,
+            accion="bloquear_usuario",
+            detalle=f"ERROR:{type(e).__name__}",
+            resultado="error",
+        )
+
+
+async def cmd_activar_usuario(update: Update, ctx: ContextTypes.DEFAULT_TYPE, sheets: SheetsRepo, authz: Authz, logger: LoggingRepo) -> None:
+    ok, role = await require_admin(update, logger, authz)
+    if not ok:
+        return
+
+    u = update.effective_user
+    chat = update.effective_chat
+    args = parse_args(update.effective_message.text or "")
+    if len(args) < 1:
+        await update.effective_message.reply_text("Formato: `/activar_usuario <user_id>`", parse_mode="Markdown")
+        return
+
+    uid_target = clean_digits(args[0])
+    if not uid_target:
+        await update.effective_message.reply_text("⚠️ user_id inválido.")
+        return
+
+    try:
+        row = {
+            "user_id": str(uid_target),
+            "activo": 1,
+            "updated_at": now_str(config.TZ_NAME),
+        }
+        res = sheets.upsert_by_key(config.TAB_USUARIOS, "user_id", row)
+
+        usuarios = sheets.get_all_records(config.TAB_USUARIOS)
+        authz.load(usuarios)
+
+        await update.effective_message.reply_text(f"✅ Usuario activado: {uid_target} (activo=1)")
+        logger.log(
+            chat_id=chat.id,
+            user_id=u.id,
+            username=u.username or "",
+            rol_detectado=role,
+            accion="activar_usuario",
+            detalle=f"{res} user_id={uid_target}",
+            resultado="ok",
+        )
+    except Exception as e:
+        await update.effective_message.reply_text("⚠️ No pude activar (revisar Sheet/headers).")
+        logger.log(
+            chat_id=chat.id,
+            user_id=u.id,
+            username=u.username or "",
+            rol_detectado=role,
+            accion="activar_usuario",
+            detalle=f"ERROR:{type(e).__name__}",
+            resultado="error",
+        )
+
+
+async def cmd_listar_usuarios(update: Update, ctx: ContextTypes.DEFAULT_TYPE, sheets: SheetsRepo, authz: Authz, logger: LoggingRepo) -> None:
+    ok, role = await require_admin(update, logger, authz)
+    if not ok:
+        return
+
+    u = update.effective_user
+    chat = update.effective_chat
+
+    try:
+        usuarios = sheets.get_all_records(config.TAB_USUARIOS)
+        # Orden: activos primero, luego rol, luego id
+        def keyfn(r):
+            activo = str(r.get("activo", "")).strip()
+            activo_num = 1 if activo in ("1", "TRUE", "true") else 0
+            rol = str(r.get("rol", "")).strip().lower()
+            uid = str(r.get("user_id", "")).strip()
+            return (-activo_num, rol, uid)
+
+        usuarios_sorted = sorted(usuarios, key=keyfn)
+
+        lines = ["👥 *USUARIOS AUTORIZADOS* (máx 20)\n"]
+        count = 0
+        for r in usuarios_sorted:
+            uid = str(r.get("user_id", "")).strip()
+            if not uid:
+                continue
+            rol_u = str(r.get("rol", "")).strip().lower() or "user"
+            activo = str(r.get("activo", "")).strip()
+            activo_ok = "✅" if activo in ("1", "TRUE", "true") else "🚫"
+            lines.append(f"{activo_ok} `{uid}` — {rol_u}")
+            count += 1
+            if count >= 20:
+                break
+
+        await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+        logger.log(
+            chat_id=chat.id,
+            user_id=u.id,
+            username=u.username or "",
+            rol_detectado=role,
+            accion="listar_usuarios",
+            detalle=f"count={count}",
+            resultado="ok",
+        )
+    except Exception as e:
+        await update.effective_message.reply_text("⚠️ No pude listar usuarios.")
+        logger.log(
+            chat_id=chat.id,
+            user_id=u.id,
+            username=u.username or "",
+            rol_detectado=role,
+            accion="listar_usuarios",
+            detalle=f"ERROR:{type(e).__name__}",
+            resultado="error",
+        )
+
+
+# -------------------- Bootstrap --------------------
 
 def main() -> None:
     sheets = SheetsRepo(config.GOOGLE_CREDS_JSON_TEXT, config.SHEET_ID)
@@ -687,16 +905,14 @@ def main() -> None:
     sessions = SessionManager(config.SESSION_TTL_MIN)
     logger = LoggingRepo(sheets, config.TAB_LOG, config.TZ_NAME)
 
-    # Cache mutable (para /reload_sheet)
     cache: Dict[str, List[Dict]] = {"asegurados": load_caches(sheets, authz)}
 
     app = Application.builder().token(config.BOT_TOKEN).build()
 
-    # /start /help
+    # Base
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
 
-    # /id
     async def _id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not await only_private_guard(update, logger, authz):
             return
@@ -704,64 +920,54 @@ def main() -> None:
 
     app.add_handler(CommandHandler("id", _id))
 
-    # /busqueda
+    async def _mi_rol(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        await cmd_mi_rol(update, ctx, authz, logger)
+
+    app.add_handler(CommandHandler("mi_rol", _mi_rol))
+
     async def _busqueda(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await cmd_busqueda(update, ctx, authz, sessions, logger)
 
     app.add_handler(CommandHandler("busqueda", _busqueda))
 
-    # /cancelar
     async def _cancelar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await cmd_cancelar(update, ctx, sessions, logger, authz)
 
     app.add_handler(CommandHandler("cancelar", _cancelar))
 
-    # ✅ /reload_sheet (solo admin/superadmin)
-    async def _reload_sheet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if not await only_private_guard(update, logger, authz):
-            return
+    # Admin
+    async def _reload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        await cmd_reload_sheet(update, ctx, sheets, authz, cache, logger)
 
-        u = update.effective_user
-        chat = update.effective_chat
+    app.add_handler(CommandHandler("reload_sheet", _reload))
 
-        if not authz.is_allowed(u.id):
-            await update.effective_message.reply_text(msg.NOT_AUTH_MSG)
-            logger.log(chat.id, u.id, u.username or "", authz.role(u.id),
-                       "reload_sheet", "DENEGADO: no_autorizado", "denegado")
-            return
+    async def _nuevo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        await cmd_nuevo_usuario(update, ctx, sheets, authz, sessions, logger)
 
-        role = authz.role(u.id)
-        if role not in ("admin", "superadmin"):
-            await update.effective_message.reply_text("❌ Solo administradores pueden recargar datos.")
-            logger.log(chat.id, u.id, u.username or "", role,
-                       "reload_sheet", "DENEGADO: rol_sin_permiso", "denegado")
-            return
+    app.add_handler(CommandHandler("nuevo_usuario", _nuevo))
 
-        try:
-            usuarios = sheets.get_all_records(config.TAB_USUARIOS)
-            authz.load(usuarios)
-            asegurados = sheets.get_all_records(config.TAB_ASEGURADOS)
-            cache["asegurados"] = asegurados
+    async def _bloquear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        await cmd_bloquear_usuario(update, ctx, sheets, authz, logger)
 
-            await update.effective_message.reply_text(
-                f"✅ Recargado.\nAsegurados: {len(asegurados)}\nUsuarios: {len(usuarios)}"
-            )
-            logger.log(chat.id, u.id, u.username or "", authz.role(u.id),
-                       "reload_sheet", f"OK asegurados={len(asegurados)} usuarios={len(usuarios)}", "ok")
-        except Exception as e:
-            await update.effective_message.reply_text("⚠️ Error recargando datos (revisar permisos/Sheet).")
-            logger.log(chat.id, u.id, u.username or "", role,
-                       "reload_sheet", f"ERROR:{type(e).__name__}", "error")
+    app.add_handler(CommandHandler("bloquear_usuario", _bloquear))
 
-    app.add_handler(CommandHandler("reload_sheet", _reload_sheet))
+    async def _activar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        await cmd_activar_usuario(update, ctx, sheets, authz, logger)
 
-    # callbacks
+    app.add_handler(CommandHandler("activar_usuario", _activar))
+
+    async def _listar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        await cmd_listar_usuarios(update, ctx, sheets, authz, logger)
+
+    app.add_handler(CommandHandler("listar_usuarios", _listar))
+
+    # Callbacks
     async def _cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await on_callback(update, ctx, cache["asegurados"], drive, authz, sessions, logger)
 
     app.add_handler(CallbackQueryHandler(_cb))
 
-    # texto (no comandos)
+    # Texto normal
     async def _text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await on_text(update, ctx, cache["asegurados"], drive, authz, sessions, logger)
 
