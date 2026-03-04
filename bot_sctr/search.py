@@ -1,90 +1,138 @@
 import re
-from datetime import datetime, date
-from zoneinfo import ZoneInfo
-from typing import Dict, List, Tuple, Optional
+from typing import List, Dict
+from datetime import datetime
+import pytz
 
-def norm_text(s: str) -> str:
-    s = (s or "").strip().upper()
-    s = re.sub(r"\s+", " ", s)
-    return s
 
-def clean_digits(s: str) -> str:
-    return re.sub(r"[^0-9]", "", (s or ""))
+# ---------------------------------------------------------
+# LIMPIAR DIGITOS
+# ---------------------------------------------------------
+def clean_digits(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r"\D", "", str(text))
 
-def mask_doc(doc_norm: str) -> str:
-    d = clean_digits(doc_norm)
-    if len(d) == 8:
-        return "****" + d[-4:]
-    if len(d) == 9:
-        return "*****" + d[-4:]
-    return "****" + (d[-4:] if len(d) >= 4 else d)
 
-def parse_sheet_date(v) -> Optional[date]:
-    # gspread get_all_records usually returns either a date-like string or empty.
-    if v in (None, ""):
-        return None
-    s = str(v).strip()
-    # Try common formats: YYYY-MM-DD, DD/MM/YYYY
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except:
-            pass
-    return None
+# ---------------------------------------------------------
+# NORMALIZAR DOCUMENTO (FIX CEROS INICIALES)
+# ---------------------------------------------------------
+def normalize_doc(doc: str) -> str:
+    """
+    Normaliza DNI / CE para evitar problemas con ceros iniciales.
 
-def compute_status(vig_hasta, tz_name: str) -> Tuple[str, Optional[int], Optional[int]]:
-    tz = ZoneInfo(tz_name)
-    today = datetime.now(tz).date()
-    hasta = parse_sheet_date(vig_hasta)
-    if not hasta:
-        return ("SIN FECHA", None, None)
+    Reglas:
+    DNI → 8 dígitos
+    CE  → 9 dígitos
+    """
 
-    if today <= hasta:
-        days_left = (hasta - today).days
-        return ("ACTIVO", days_left, None)
-    else:
-        days_over = (today - hasta).days
-        return ("VENCIDO", None, days_over)
+    digits = clean_digits(doc)
 
-def find_by_doc(records: List[Dict], doc_norm: str) -> List[Dict]:
-    target = clean_digits(doc_norm)
-    out = []
-    for r in records:
-        dn = clean_digits(str(r.get("doc_norm", r.get("nro_doc", ""))))
-        if dn == target and dn != "":
-            out.append(r)
-    return out
+    if len(digits) <= 8:
+        return digits.zfill(8)
 
-def find_by_apellidos(records: List[Dict], paterno: str, materno: str) -> List[Dict]:
-    p = norm_text(paterno)
-    m = norm_text(materno)
-    out = []
-    for r in records:
-        rp = norm_text(str(r.get("apellido_paterno", "")))
-        rm = norm_text(str(r.get("apellido_materno", "")))
-        if rp == p and rm == m:
-            out.append(r)
-    return out
+    return digits.zfill(9)
 
+
+# ---------------------------------------------------------
+# MASCAR DOCUMENTO
+# ---------------------------------------------------------
+def mask_doc(doc: str) -> str:
+
+    doc = clean_digits(doc)
+
+    if len(doc) <= 4:
+        return doc
+
+    return "*" * (len(doc) - 4) + doc[-4:]
+
+
+# ---------------------------------------------------------
+# FORMATEAR FECHA
+# ---------------------------------------------------------
+def format_fecha(fecha: str, tz_name: str = "America/Lima") -> str:
+
+    if not fecha:
+        return "—"
+
+    try:
+        dt = datetime.strptime(fecha[:10], "%Y-%m-%d")
+        tz = pytz.timezone(tz_name)
+        dt = tz.localize(dt)
+        return dt.strftime("%d/%m/%Y")
+    except:
+        return fecha
+
+
+# ---------------------------------------------------------
+# FICHA DEL ASEGURADO
+# ---------------------------------------------------------
 def build_ficha(r: Dict, tz_name: str) -> str:
-    nombre = str(r.get("apellidos_y_nombres", "")).strip()
-    empresa = str(r.get("empresa", "")).strip()
-    desde = str(r.get("vigencia_desde", "")).strip()
-    hasta = str(r.get("vigencia_hasta", "")).strip()
 
-    est, days_left, days_over = compute_status(hasta, tz_name)
-    lines = [
-        f"Nombre: {nombre}",
-        f"Empresa: {empresa}",
-        f"Inicio: {desde}",
-        f"Final: {hasta if hasta else '—'}",
-        f"Estado: {est}",
-    ]
-    if est == "ACTIVO" and days_left is not None:
-        lines.append(f"Días restantes: {days_left}")
-    elif est == "VENCIDO" and days_over is not None:
-        lines.append(f"Vencido hace: {days_over} días")
-    else:
-        lines.append("Días: N/A")
+    nombre = r.get("apellidos_y_nombres", "")
+    doc = mask_doc(r.get("doc_norm", r.get("nro_doc", "")))
 
-    return "\n".join(lines)
+    empresa = r.get("empresa", "—")
+    modelo = r.get("modelo", "—")
+
+    fecha_inicio = format_fecha(r.get("fecha_inicio", ""), tz_name)
+    fecha_fin = format_fecha(r.get("fecha_fin", ""), tz_name)
+
+    estado = r.get("estado", "—")
+
+    ficha = f"""
+📋 **DATOS DEL ASEGURADO**
+
+👤 Nombre: {nombre}
+🪪 Documento: {doc}
+
+🏢 Empresa: {empresa}
+📑 Modelo: {modelo}
+
+📅 Inicio: {fecha_inicio}
+📅 Fin: {fecha_fin}
+
+📊 Estado: {estado}
+"""
+
+    return ficha.strip()
+
+
+# ---------------------------------------------------------
+# BUSCAR POR DOCUMENTO
+# ---------------------------------------------------------
+def find_by_doc(data: List[Dict], doc: str) -> List[Dict]:
+
+    doc_norm = normalize_doc(doc)
+
+    results = []
+
+    for r in data:
+
+        sheet_doc = normalize_doc(
+            r.get("doc_norm", r.get("nro_doc", ""))
+        )
+
+        if sheet_doc == doc_norm:
+            results.append(r)
+
+    return results
+
+
+# ---------------------------------------------------------
+# BUSCAR POR APELLIDOS
+# ---------------------------------------------------------
+def find_by_apellidos(data: List[Dict], paterno: str, materno: str) -> List[Dict]:
+
+    paterno = paterno.strip().lower()
+    materno = materno.strip().lower()
+
+    results = []
+
+    for r in data:
+
+        nombre = str(r.get("apellidos_y_nombres", "")).lower()
+
+        if paterno in nombre and materno in nombre:
+            results.append(r)
+
+    return results
