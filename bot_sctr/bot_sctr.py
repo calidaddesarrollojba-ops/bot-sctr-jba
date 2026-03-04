@@ -9,16 +9,15 @@ from telegram.ext import (
 )
 
 from . import config
-import messages as msg
-from . import config
 from . import messages as msg
 from .sheets_repo import SheetsRepo
 from .drive_repo import DriveRepo
 from .authz import Authz
 from .session import SessionManager
 from .logging_repo import LoggingRepo
-from .search import clean_digits, mask_doc, build_ficha, find_by_doc, find_by_apellidos
-
+from .search import (
+    clean_digits, mask_doc, build_ficha,
+    find_by_doc, find_by_apellidos,
 )
 
 # Callback data constants
@@ -440,4 +439,5 @@ async def main():
 if __name__ == "__main__":
 
     asyncio.run(main())
+
 
