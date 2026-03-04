@@ -430,14 +430,12 @@ async def main():
 
     # (Opcional) refresco simple cada X minutos: aquí no lo hago automático para mantener skeleton simple.
 
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
     print("Bot running (polling)...")
-    await app.updater.idle()
+    await app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
 
     asyncio.run(main())
+
 
 
