@@ -1,7 +1,7 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional
-from sheets_repo import SheetsRepo
+from .sheets_repo import SheetsRepo
 
 class LoggingRepo:
     def __init__(self, sheets: SheetsRepo, tab_log: str, tz_name: str):
@@ -35,4 +35,5 @@ class LoggingRepo:
             "archivo_origen": archivo_origen,
             "file_id_drive": file_id_drive,
             "latencia_ms": latencia_ms,
+
         })
