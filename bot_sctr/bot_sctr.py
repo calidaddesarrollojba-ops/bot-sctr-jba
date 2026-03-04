@@ -8,7 +8,7 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
-import config
+from . import config
 import messages as msg
 from sheets_repo import SheetsRepo
 from drive_repo import DriveRepo
@@ -437,4 +437,5 @@ async def main():
     await app.updater.idle()
 
 if __name__ == "__main__":
+
     asyncio.run(main())
